@@ -549,7 +549,8 @@ class SenseVoiceEncoderSmall(nn.Module):
         ilens: torch.Tensor,
     ):
         """Embed positions in tensor."""
-        masks = sequence_mask(ilens, device=ilens.device)[:, None, :]
+        xs_pad_len = xs_pad.shape[1]
+        masks = sequence_mask(ilens, maxlen=xs_pad_len, device=ilens.device)[:, None, :]
 
         xs_pad *= self.output_size() ** 0.5
 
@@ -667,8 +668,6 @@ class SenseVoiceSmall(nn.Module):
                 text: (Batch, Length)
                 text_lengths: (Batch,)
         """
-        # import pdb;
-        # pdb.set_trace()
         if len(text_lengths.size()) > 1:
             text_lengths = text_lengths[:, 0]
         if len(speech_lengths.size()) > 1:
@@ -849,6 +848,11 @@ class SenseVoiceSmall(nn.Module):
         speech_lengths += 3
 
         # Encoder
+        if  hasattr(self.encoder, "clear_cache") \
+            and hasattr(self, "buckets"):
+            # print(f"before padding, {speech.shape}")
+            speech = self.buckets.pad_to_buckets(speech)
+            # print(f"after padding, {speech.shape}")
         encoder_out, encoder_out_lens = self.encoder(speech, speech_lengths)
         if isinstance(encoder_out, tuple):
             encoder_out = encoder_out[0]

@@ -8,9 +8,14 @@ from typing_extensions import Annotated
 from typing import List
 from enum import Enum
 import torchaudio
+import torch
+import habana_frameworks.torch as htorch
+from utils.gaudi_extension import Buckets
 from model import SenseVoiceSmall
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from io import BytesIO
+import time
+import os
 
 TARGET_FS = 16000
 
@@ -26,7 +31,18 @@ class Language(str, Enum):
 
 
 model_dir = "iic/SenseVoiceSmall"
-m, kwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device=os.getenv("SENSEVOICE_DEVICE", "cuda:0"))
+m, kwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device=os.getenv("SENSEVOICE_DEVICE", "hpu"))
+lazy_mode = os.getenv("PT_HPU_LAZY_MODE", "0") == "1"
+skip_warmup = os.getenv("SKIP_HPU_WARMUP", "0") == "1"
+
+if lazy_mode:
+    m.encoder=htorch.hpu.wrap_in_hpu_graph(m.encoder)
+    m.buckets = Buckets()
+    if not skip_warmup:
+        t1 = time.perf_counter()
+        m.buckets.warmup_encoder(m.encoder)
+        t2 = time.perf_counter()
+        print(f"warmup time: {t2-t1}")
 m.eval()
 
 regex = r"<\|.*\|>"
