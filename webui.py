@@ -6,9 +6,12 @@ import base64
 import io
 import gradio as gr
 import re
+import time
 
 import numpy as np
 import torch
+import habana_frameworks.torch as htorch
+from utils.gaudi_extension import Buckets
 import torchaudio
 
 
@@ -19,7 +22,15 @@ model = AutoModel(model=model,
 				  vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
 				  vad_kwargs={"max_single_segment_time": 30000},
 				  trust_remote_code=True,
+				  device="hpu",
 				  )
+model.model.encoder = htorch.hpu.wrap_in_hpu_graph(model.model.encoder)
+model.model.buckets = Buckets()
+t1 = time.perf_counter()
+model.model.buckets.warmup_encoder(model.model.encoder)
+t2 = time.perf_counter()
+print(f"warmup time: {t2 - t1}")
+model.model.eval()
 
 import re
 
@@ -157,9 +168,10 @@ def model_inference(input_wav, language, fs=16000):
 			input_wav = input_wav.mean(-1)
 		if fs != 16000:
 			print(f"audio_fs: {fs}")
-			resampler = torchaudio.transforms.Resample(fs, 16000)
-			input_wav_t = torch.from_numpy(input_wav).to(torch.float32)
-			input_wav = resampler(input_wav_t[None, :])[0, :].numpy()
+			# Always resample on CPU to avoid device mismatch with HPU
+			resampler = torchaudio.transforms.Resample(fs, 16000).to('cpu')
+			input_wav_t = torch.from_numpy(input_wav).to(torch.float32).to('cpu')
+			input_wav = resampler(input_wav_t[None, :])[0, :].cpu().numpy()
 	
 	
 	merge_vad = True #False if selected_task == "ASR" else True
@@ -185,19 +197,19 @@ audio_examples = [
     ["example/en.mp3", "en"],
     ["example/ja.mp3", "ja"],
     ["example/ko.mp3", "ko"],
-    ["example/emo_1.wav", "auto"],
-    ["example/emo_2.wav", "auto"],
-    ["example/emo_3.wav", "auto"],
+    #["example/emo_1.wav", "auto"],
+    #["example/emo_2.wav", "auto"],
+    #["example/emo_3.wav", "auto"],
     #["example/emo_4.wav", "auto"],
     #["example/event_1.wav", "auto"],
     #["example/event_2.wav", "auto"],
     #["example/event_3.wav", "auto"],
-    ["example/rich_1.wav", "auto"],
-    ["example/rich_2.wav", "auto"],
+    #["example/rich_1.wav", "auto"],
+    #["example/rich_2.wav", "auto"],
     #["example/rich_3.wav", "auto"],
-    ["example/longwav_1.wav", "auto"],
-    ["example/longwav_2.wav", "auto"],
-    ["example/longwav_3.wav", "auto"],
+    #["example/longwav_1.wav", "auto"],
+    #["example/longwav_2.wav", "auto"],
+    #["example/longwav_3.wav", "auto"],
     #["example/longwav_4.wav", "auto"],
 ]
 
@@ -218,16 +230,17 @@ html_content = """
 
 
 def launch():
-	with gr.Blocks(theme=gr.themes.Soft()) as demo:
+	with gr.Blocks() as demo:
 		# gr.Markdown(description)
 		gr.HTML(html_content)
 		with gr.Row():
 			with gr.Column():
-				audio_inputs = gr.Audio(label="Upload audio or use the microphone")
+				# Use numpy audio to avoid Gradio cache move restrictions on local example files
+				audio_inputs = gr.Audio(label="Upload audio or use the microphone", type="numpy", value=audio_examples[0][0])
 				
 				with gr.Accordion("Configuration"):
 					language_inputs = gr.Dropdown(choices=["auto", "zh", "en", "yue", "ja", "ko", "nospeech"],
-												  value="auto",
+												  value=audio_examples[0][1],
 												  label="Language")
 				fn_button = gr.Button("Start", variant="primary")
 				text_outputs = gr.Textbox(label="Results")
@@ -235,7 +248,7 @@ def launch():
 		
 		fn_button.click(model_inference, inputs=[audio_inputs, language_inputs], outputs=text_outputs)
 
-	demo.launch()
+	demo.queue(max_size=32, default_concurrency_limit=1).launch(server_name=os.environ.get("HOST", "0.0.0.0"), server_port=int(os.environ.get("PORT", "7860")))
 
 
 if __name__ == "__main__":
