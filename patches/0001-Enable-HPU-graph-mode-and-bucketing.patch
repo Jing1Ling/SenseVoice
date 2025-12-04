@@ -1,0 +1,179 @@
+From 14ed9b31ac3d458ad891f465a3bc564849f4842f Mon Sep 17 00:00:00 2001
+From: Jing <jing1.ling@intel.com>
+Date: Thu, 13 Nov 2025 10:46:10 +0800
+Subject: [PATCH 1/5] Enable HPU graph mode and bucketing
+
+---
+ api.py                   | 18 ++++++++++++++++-
+ infer.py                 | 43 ++++++++++++++++++++++++++++++++++++++++
+ model.py                 | 10 +++++++---
+ utils/gaudi_extension.py | 32 ++++++++++++++++++++++++++++++
+ 4 files changed, 99 insertions(+), 4 deletions(-)
+ create mode 100644 infer.py
+ create mode 100644 utils/gaudi_extension.py
+
+diff --git a/api.py b/api.py
+index 88d0398..ace9091 100644
+--- a/api.py
++++ b/api.py
+@@ -8,9 +8,14 @@ from typing_extensions import Annotated
+ from typing import List
+ from enum import Enum
+ import torchaudio
++import torch
++import habana_frameworks.torch as htorch
++from utils.gaudi_extension import Buckets
+ from model import SenseVoiceSmall
+ from funasr.utils.postprocess_utils import rich_transcription_postprocess
+ from io import BytesIO
++import time
++import os
+ 
+ TARGET_FS = 16000
+ 
+@@ -26,7 +31,18 @@ class Language(str, Enum):
+ 
+ 
+ model_dir = "iic/SenseVoiceSmall"
+-m, kwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device=os.getenv("SENSEVOICE_DEVICE", "cuda:0"))
++m, kwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device=os.getenv("SENSEVOICE_DEVICE", "hpu"))
++lazy_mode = os.getenv("PT_HPU_LAZY_MODE", "0") == "1"
++skip_warmup = os.getenv("SKIP_HPU_WARMUP", "0") == "1"
++
++if lazy_mode:
++    m.encoder=htorch.hpu.wrap_in_hpu_graph(m.encoder)
++    m.buckets = Buckets()
++    if not skip_warmup:
++        t1 = time.perf_counter()
++        m.buckets.warmup_encoder(m.encoder)
++        t2 = time.perf_counter()
++        print(f"warmup time: {t2-t1}")
+ m.eval()
+ 
+ regex = r"<\|.*\|>"
+diff --git a/infer.py b/infer.py
+new file mode 100644
+index 0000000..0d4a7f3
+--- /dev/null
++++ b/infer.py
+@@ -0,0 +1,43 @@
++from model import SenseVoiceSmall
++import torch
++import habana_frameworks.torch as htorch
++from funasr.utils.postprocess_utils import rich_transcription_postprocess
++import torch
++import habana_frameworks.torch as htorch
++from utils.gaudi_extension import Buckets
++import time
++import os
++
++model_dir = "iic/SenseVoiceSmall"
++m, kwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device="hpu")
++lazy_mode = os.getenv("PT_HPU_LAZY_MODE", "0") == "1"
++skip_warmup = os.getenv("SKIP_HPU_WARMUP", "0") == "1"
++
++if lazy_mode:
++    m.encoder=htorch.hpu.wrap_in_hpu_graph(m.encoder)
++    m.buckets = Buckets()
++    if not skip_warmup:
++        t1 = time.perf_counter()
++        m.buckets.warmup_encoder(m.encoder)
++        t2 = time.perf_counter()
++        print(f"warmup time: {t2-t1}")
++m.eval()
++
++res = m.inference(
++    data_in=f"{kwargs ['model_path']}/example/zh.mp3",
++    language="zh", # "zh", "en", "yue", "ja", "ko", "nospeech"
++    use_itn=True,
++    ban_emo_unk=False,
++    **kwargs,
++)
++res = m.inference(
++    data_in=f"{kwargs ['model_path']}/example/zh.mp3",
++    language="zh", # "zh", "en", "yue", "ja", "ko", "nospeech"
++    use_itn=True,
++    ban_emo_unk=False,
++    data_lengths=torch.tensor([760]),
++    **kwargs,
++)
++
++text = rich_transcription_postprocess(res [0][0]["text"])
++print(text)
+diff --git a/model.py b/model.py
+index a89defd..eb75f08 100644
+--- a/model.py
++++ b/model.py
+@@ -549,7 +549,8 @@ class SenseVoiceEncoderSmall(nn.Module):
+         ilens: torch.Tensor,
+     ):
+         """Embed positions in tensor."""
+-        masks = sequence_mask(ilens, device=ilens.device)[:, None, :]
++        xs_pad_len = xs_pad.shape[1]
++        masks = sequence_mask(ilens, maxlen=xs_pad_len, device=ilens.device)[:, None, :]
+ 
+         xs_pad *= self.output_size() ** 0.5
+ 
+@@ -667,8 +668,6 @@ class SenseVoiceSmall(nn.Module):
+                 text: (Batch, Length)
+                 text_lengths: (Batch,)
+         """
+-        # import pdb;
+-        # pdb.set_trace()
+         if len(text_lengths.size()) > 1:
+             text_lengths = text_lengths[:, 0]
+         if len(speech_lengths.size()) > 1:
+@@ -849,6 +848,11 @@ class SenseVoiceSmall(nn.Module):
+         speech_lengths += 3
+ 
+         # Encoder
++        if  hasattr(self.encoder, "clear_cache") \
++            and hasattr(self, "buckets"):
++            # print(f"before padding, {speech.shape}")
++            speech = self.buckets.pad_to_buckets(speech)
++            # print(f"after padding, {speech.shape}")
+         encoder_out, encoder_out_lens = self.encoder(speech, speech_lengths)
+         if isinstance(encoder_out, tuple):
+             encoder_out = encoder_out[0]
+diff --git a/utils/gaudi_extension.py b/utils/gaudi_extension.py
+new file mode 100644
+index 0000000..9ae1f37
+--- /dev/null
++++ b/utils/gaudi_extension.py
+@@ -0,0 +1,32 @@
++import torch
++import  habana_frameworks.torch as htorch
++import torch.nn.functional as F
++from tqdm import tqdm
++
++class Buckets:
++
++    def __init__(self, feature_dim=560):
++        self.feature_dim = feature_dim
++        self.device = "hpu"
++        self.buckets = [32, 64, 96, 128, 192, 256, 512, 768, 1024, 1536]
++        print(f"Created buckets:{self.buckets}")
++    
++    def warmup_encoder(self, encoder, repeat=3):
++        print(f"Warmup encoder graph for {len(self.buckets)} buckets...")
++        for frames in tqdm(self.buckets):
++            x = torch.randn(1, frames, self.feature_dim, device=self.device)
++            x_len = torch.tensor([frames], dtype=torch.int32, device=self.device)
++            for i in range(repeat):
++                with torch.no_grad():
++                    _ = encoder(x, x_len)
++        print("Encoder graph warmup complete.")
++    
++    def pad_to_buckets(self, speech):
++        assert len(speech.shape) == 3  # (bs, frame, feat)
++        frame = speech.shape[1]
++        if frame in self.buckets or frame > self.buckets[-1]:
++            return speech
++        for bucket in self.buckets:
++            if frame < bucket:
++                speech = F.pad(speech, (0, 0, 0, max(0, bucket - frame)))
++                return speech
+\ No newline at end of file
+-- 
+2.34.1
+

@@ -1,0 +1,128 @@
+From ba2026465ccffd162a11959df069fd644184aa00 Mon Sep 17 00:00:00 2001
+From: Jing <jing1.ling@intel.com>
+Date: Thu, 13 Nov 2025 10:49:45 +0800
+Subject: [PATCH 2/5] Add fastapi_client.py for concurrent ASR benchmark
+
+---
+ fastapi_client.py | 109 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 109 insertions(+)
+ create mode 100644 fastapi_client.py
+
+diff --git a/fastapi_client.py b/fastapi_client.py
+new file mode 100644
+index 0000000..60eb179
+--- /dev/null
++++ b/fastapi_client.py
+@@ -0,0 +1,109 @@
++import aiohttp
++import asyncio
++import time
++import argparse
++from aiohttp import FormData
++import os
++import glob
++import soundfile as sf
++from tqdm.asyncio import tqdm_asyncio
++
++API_URL = "http://localhost:{port}/api/v1/asr"
++
++
++async def post_audio(session, url, audio_path, key, lang="auto", semaphore=None):
++    """
++    Send a single audio file to the ASR API.
++    """
++    form = FormData()
++    form.add_field("files", open(audio_path, "rb"),
++                   filename=os.path.basename(audio_path),
++                   content_type="audio/mpeg")
++    form.add_field("keys", key)
++    form.add_field("lang", lang)
++
++    async with semaphore:  # limit concurrency
++        start = time.time()
++        async with session.post(url, data=form) as resp:
++            text = await resp.text()
++        elapsed = time.time() - start
++    return key, elapsed, text
++
++
++def get_audio_length(file_path):
++    """
++    Calculate the duration of an audio file (in seconds).
++    """
++    info = sf.info(file_path)
++    return info.frames / info.samplerate
++
++
++async def main(args):
++    """
++    Launch multiple concurrent ASR requests and calculate RTF.
++    """
++    url = API_URL.format(port=args.port)
++    audio_files = []
++    for path in args.files:
++        if os.path.isdir(path):
++            # Add all .wav / .mp3 / .flac files in the directory (non-recursive)
++            audio_files.extend(sorted(
++                glob.glob(os.path.join(path, "*.wav")) +
++                glob.glob(os.path.join(path, "*.mp3")) +
++                glob.glob(os.path.join(path, "*.flac"))
++            ))
++        else:
++            audio_files.append(path)
++    audio_files = audio_files[:args.limit]
++    concurrency = args.concurrency
++    semaphore = asyncio.Semaphore(concurrency)
++
++    # Collect durations first
++    durations = [get_audio_length(f) for f in audio_files]
++
++    async with aiohttp.ClientSession() as session:
++        tasks = []
++        for i, audio in enumerate(audio_files):
++            key = f"sample_{i}"
++            tasks.append(post_audio(session, url, audio, key, args.lang, semaphore))
++
++        t0 = time.time()
++        # results = await asyncio.gather(*tasks)
++        results = await tqdm_asyncio.gather(*tasks, desc="Processing audios", total=len(tasks))
++        total_time = time.time() - t0
++
++    # Print individual results
++    print("\n===== Concurrent Request Results =====")
++    for (key, elapsed, result), dur in zip(results, durations):
++        print(f"{key}: duration={dur:.2f}s, elapsed={elapsed:.3f}s, RTF={elapsed/dur:.4f}")
++
++    # Compute RTF metrics
++    total_audio_time = sum(durations)
++    max_audio_time = max(durations)
++    avg_elapsed = sum([r[1] for r in results]) / len(results)
++
++    # Two RTF definitions:
++    rtf_avg = sum([r[1]/d for r, d in zip(results, durations)]) / len(results)
++    rtf_aggregate = total_time / total_audio_time
++
++    print("\n===== Summary =====")
++    print(f"Total audio count: {len(audio_files)}")
++    print(f"Concurrency level: {concurrency}")
++    print(f"Total wall time: {total_time:.3f}s")
++    print(f"Total audio time (sum): {total_audio_time:.3f}s")
++    print(f"Max audio time (single longest): {max_audio_time:.3f}s")
++    print(f"Average per-request elapsed: {avg_elapsed:.3f}s")
++    print(f"RTF (total_time / total_audio_time): {rtf_aggregate:.4f}")
++    print(f"RTF (average RTF): {rtf_avg:.4f}")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--port", type=int, default=50000)
++    parser.add_argument("--concurrency", type=int, default=3)
++    parser.add_argument("--lang", type=str, default="auto")
++    parser.add_argument("--files", nargs="+", required=True, help="List of audio file paths")
++    parser.add_argument("--limit", type=int, default=1000)
++    args = parser.parse_args()
++
++    asyncio.run(main(args))
+-- 
+2.34.1
+

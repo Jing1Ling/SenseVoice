@@ -1,0 +1,22 @@
+From 9d42e1b87ebcd1dc28ecd0f4d80c7612daf57e58 Mon Sep 17 00:00:00 2001
+From: Haihao Xiang <haihao.xiang@intel.com>
+Date: Thu, 4 Dec 2025 10:31:12 +0800
+Subject: [PATCH 3/5] Update the dependency on torch
+
+---
+ requirements.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/requirements.txt b/requirements.txt
+index b8f0a63..994e2f8 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,4 +1,4 @@
+-torch<=2.3
++# torch<=2.3
+ torchaudio
+ modelscope
+ huggingface
+-- 
+2.34.1
+
