@@ -10,27 +10,94 @@ import time
 
 import numpy as np
 import torch
-import habana_frameworks.torch as htorch
-from utils.gaudi_extension import Buckets
 import torchaudio
 
 
 from funasr import AutoModel
 
-model = "iic/SenseVoiceSmall"
-model = AutoModel(model=model,
-				  vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-				  vad_kwargs={"max_single_segment_time": 30000},
-				  trust_remote_code=True,
-				  device="hpu",
-				  )
-model.model.encoder = htorch.hpu.wrap_in_hpu_graph(model.model.encoder)
-model.model.buckets = Buckets()
-t1 = time.perf_counter()
-model.model.buckets.warmup_encoder(model.model.encoder)
-t2 = time.perf_counter()
-print(f"warmup time: {t2 - t1}")
-model.model.eval()
+# Subprocess-based HPU handler (mirrors MuseTalk pattern)
+import multiprocessing
+
+_task_queue = None
+_result_queue = None
+_task_event = None
+_ready_event = None
+_shutdown_event = None
+_hpu_ps = None
+
+def _hpu_child_process(task_queue, result_queue, task_event, shutdown_event, ready_event):
+	import habana_frameworks.torch as htorch
+	from utils.gaudi_extension import Buckets
+
+	model_name = "iic/SenseVoiceSmall"
+	model = AutoModel(model=model_name,
+					  vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+					  vad_kwargs={"max_single_segment_time": 30000},
+					  trust_remote_code=True,
+					  device="hpu",
+					  )
+	model.model.encoder = htorch.hpu.wrap_in_hpu_graph(model.model.encoder)
+	model.model.buckets = Buckets()
+	t1 = time.perf_counter()
+	model.model.buckets.warmup_encoder(model.model.encoder)
+	t2 = time.perf_counter()
+	print(f"warmup time: {t2 - t1}")
+	model.model.eval()
+
+	# Signal parent that child finished init and entered serving loop
+	ready_event.set()
+
+	while not shutdown_event.is_set():
+		task_event.wait(timeout=2)
+		if shutdown_event.is_set():
+			break
+		task_event.clear()
+		while True:
+			try:
+				task = task_queue.get_nowait()
+			except Exception:
+				break
+			if task is None:
+				continue
+			input_wav = task.get("input_wav")
+			language = task.get("language", "auto")
+			try:
+				text = model.generate(input=input_wav,
+									  cache={},
+									  language=language,
+									  use_itn=True,
+									  batch_size_s=60,
+									  merge_vad=True)
+				result_queue.put({"ok": True, "text": text})
+			except Exception as e:
+				result_queue.put({"ok": False, "error": str(e)})
+
+def _ensure_hpu_subprocess_started():
+	global _task_queue, _result_queue, _task_event, _shutdown_event, _ready_event, _hpu_ps
+	if _hpu_ps and _hpu_ps.is_alive():
+		return
+	_task_queue = multiprocessing.Queue(maxsize=4)
+	_result_queue = multiprocessing.Queue(maxsize=4)
+	_task_event = multiprocessing.Event()
+	_shutdown_event = multiprocessing.Event()
+	_ready_event = multiprocessing.Event()
+	_hpu_ps = multiprocessing.Process(
+		target=_hpu_child_process,
+		args=(_task_queue, _result_queue, _task_event, _shutdown_event, _ready_event),
+		daemon=True,
+	)
+	_hpu_ps.start()
+	# Block until child signals readiness (model loaded, loop started)
+	_ready_event.wait(timeout=36000)
+
+def _stop_hpu_subprocess():
+	global _hpu_ps, _shutdown_event
+	if _hpu_ps:
+		_shutdown_event.set()
+		_hpu_ps.join(timeout=5)
+		if _hpu_ps.is_alive():
+			_hpu_ps.terminate()
+			_hpu_ps.join()
 
 import re
 
@@ -174,21 +241,28 @@ def model_inference(input_wav, language, fs=16000):
 			input_wav = resampler(input_wav_t[None, :])[0, :].cpu().numpy()
 	
 	
-	merge_vad = True #False if selected_task == "ASR" else True
-	print(f"language: {language}, merge_vad: {merge_vad}")
-	text = model.generate(input=input_wav,
-						  cache={},
-						  language=language,
-						  use_itn=True,
-						  batch_size_s=60, merge_vad=merge_vad)
-	
-	print(text)
-	text = text[0]["text"]
-	text = format_str_v3(text)
-	
-	print(text)
-	
-	return text
+	# Delegate HPU inference to child process
+	_merge_vad = True
+	print(f"language: {language}, merge_vad: {_merge_vad}")
+	_task = {
+		"input_wav": input_wav,
+		"language": language,
+	}
+	_task_queue.put(_task)
+	_task_event.set()
+	try:
+		_result = _result_queue.get(timeout=None)
+		if not _result.get("ok"):
+			raise RuntimeError(_result.get("error", "HPU child error"))
+		text = _result["text"]
+		print(text)
+		text = text[0]["text"]
+		text = format_str_v3(text)
+		print(text)
+		return text
+	except Exception as e:
+		print(f"HPU subprocess inference failed: {e}")
+		return ""
 
 
 audio_examples = [
@@ -230,6 +304,7 @@ html_content = """
 
 
 def launch():
+	_ensure_hpu_subprocess_started()
 	with gr.Blocks() as demo:
 		# gr.Markdown(description)
 		gr.HTML(html_content)
@@ -249,6 +324,7 @@ def launch():
 		fn_button.click(model_inference, inputs=[audio_inputs, language_inputs], outputs=text_outputs)
 
 	demo.queue(max_size=32, default_concurrency_limit=1).launch(server_name=os.environ.get("HOST", "0.0.0.0"), server_port=int(os.environ.get("PORT", "7860")))
+	_stop_hpu_subprocess()
 
 
 if __name__ == "__main__":
